@@ -704,15 +704,18 @@ static void renderIRInspectorApp() {
 }
 
 // ============================================================================
-// 7. CalculatorApp (Two operands, one operator, decimals, division-by-0 safety)
+// 7. CalculatorApp (Multi-operator precedence, negative real numbers, safety)
 // ============================================================================
 
-static const uint8_t CALC_MAX_EXPR = 16;
+static const uint8_t CALC_MAX_EXPR = 24;
+static const uint8_t CALC_MAX_TOKENS = 12;
 
 struct CalculatorState {
   char expr[CALC_MAX_EXPR + 1];
   uint8_t len;
   char statusLine[LCD_COLS + 1];
+  double lastResult;
+  bool hasValidResult;
   bool evaluated;
 };
 
@@ -721,8 +724,10 @@ static CalculatorState calcState;
 static void calcReset() {
   calcState.expr[0] = '\0';
   calcState.len = 0;
-  strncpy(calcState.statusLine, "A+ B- C* D/ #=", LCD_COLS);
+  strncpy(calcState.statusLine, "A+B-C*D/ *. #=", LCD_COLS);
   calcState.statusLine[LCD_COLS] = '\0';
+  calcState.lastResult = 0.0;
+  calcState.hasValidResult = false;
   calcState.evaluated = false;
   sysState.displayDirty = true;
 }
@@ -741,48 +746,9 @@ static char mapKeyToOperator(char key) {
   }
 }
 
-static bool parseSingleOperand(const char* start, uint8_t length, double* outVal) {
-  if (length == 0 || length > CALC_MAX_EXPR) {
-    return false;
-  }
-
-  char buf[CALC_MAX_EXPR + 1];
-  uint8_t dotCount = 0;
-  uint8_t digitCount = 0;
-
-  for (uint8_t i = 0; i < length; ++i) {
-    char c = start[i];
-    if (c >= '0' && c <= '9') {
-      ++digitCount;
-    } else if (c == '.') {
-      ++dotCount;
-      if (dotCount > 1) {
-        return false;
-      }
-    } else {
-      return false;
-    }
-    buf[i] = c;
-  }
-  buf[length] = '\0';
-
-  if (digitCount == 0) {
-    return false;
-  }
-
-  *outVal = atof(buf);
-  return true;
-}
-
-static void formatCalcResult(double val, char* outBuf, size_t outSize) {
-  if (isnan(val) || isinf(val) || fabs(val) > 999999999.0) {
-    strncpy(outBuf, "ERR: OVERFLOW", outSize - 1);
-    outBuf[outSize - 1] = '\0';
-    return;
-  }
-
-  char numBuf[20];
+static void formatDoubleCompact(double val, char* numBuf, size_t bufSize) {
   dtostrf(val, 1, 4, numBuf);
+  numBuf[bufSize - 1] = '\0';
 
   char* dot = strchr(numBuf, '.');
   if (dot != nullptr) {
@@ -799,72 +765,156 @@ static void formatCalcResult(double val, char* outBuf, size_t outSize) {
   if (strcmp(numBuf, "-0") == 0) {
     strcpy(numBuf, "0");
   }
+}
+
+static void formatCalcResult(double val, char* outBuf, size_t outSize) {
+  if (isnan(val) || isinf(val) || fabs(val) > 999999999.0) {
+    strncpy(outBuf, "ERR: OVERFLOW", outSize - 1);
+    outBuf[outSize - 1] = '\0';
+    calcState.hasValidResult = false;
+    return;
+  }
+
+  char numBuf[20];
+  formatDoubleCompact(val, numBuf, sizeof(numBuf));
 
   outBuf[0] = '=';
   strncpy(outBuf + 1, numBuf, outSize - 2);
   outBuf[outSize - 1] = '\0';
+  calcState.lastResult = val;
+  calcState.hasValidResult = true;
 }
 
-static void calcEvaluate() {
-  int8_t opPos = -1;
-  char opChar = '\0';
+static void setCalcError(const char* errText) {
+  strncpy(calcState.statusLine, errText, LCD_COLS);
+  calcState.statusLine[LCD_COLS] = '\0';
+  calcState.evaluated = true;
+  calcState.hasValidResult = false;
+  sysState.displayDirty = true;
+}
 
-  for (uint8_t i = 0; i < calcState.len; ++i) {
-    char c = calcState.expr[i];
-    if (isOperatorChar(c)) {
-      if (opPos != -1) {
-        strncpy(calcState.statusLine, "ERR: INVALID", LCD_COLS);
-        calcState.statusLine[LCD_COLS] = '\0';
-        calcState.evaluated = true;
-        sysState.displayDirty = true;
-        Serial.println(F("[CALC] Error: multiple operators"));
+// Parses and evaluates multi-operator expressions with unary +/- and * / > + - precedence
+static void calcEvaluate() {
+  if (calcState.len == 0) {
+    setCalcError("ERR: INVALID");
+    return;
+  }
+
+  double nums[CALC_MAX_TOKENS];
+  char ops[CALC_MAX_TOKENS];
+  uint8_t numCount = 0;
+  uint8_t opCount = 0;
+  uint8_t pos = 0;
+
+  while (pos < calcState.len) {
+    if (numCount >= CALC_MAX_TOKENS) {
+      setCalcError("ERR: TOO LONG");
+      return;
+    }
+
+    // 1. Optional unary '+' or '-' at start of operand
+    bool negative = false;
+    if (calcState.expr[pos] == '+' || calcState.expr[pos] == '-') {
+      negative = (calcState.expr[pos] == '-');
+      ++pos;
+      if (pos >= calcState.len) {
+        setCalcError("ERR: INVALID");
         return;
       }
-      opPos = static_cast<int8_t>(i);
-      opChar = c;
+    }
+
+    // 2. Digits and optional single decimal point '.'
+    char numBuf[CALC_MAX_EXPR + 1];
+    uint8_t nLen = 0;
+    uint8_t digitCount = 0;
+    uint8_t dotCount = 0;
+
+    while (pos < calcState.len) {
+      char c = calcState.expr[pos];
+      if (c >= '0' && c <= '9') {
+        ++digitCount;
+        numBuf[nLen++] = c;
+        ++pos;
+      } else if (c == '.') {
+        ++dotCount;
+        if (dotCount > 1) {
+          setCalcError("ERR: INVALID");
+          return;
+        }
+        numBuf[nLen++] = c;
+        ++pos;
+      } else {
+        break;
+      }
+    }
+    numBuf[nLen] = '\0';
+
+    if (digitCount == 0) {
+      setCalcError("ERR: INVALID");
+      return;
+    }
+
+    double val = atof(numBuf);
+    if (negative) {
+      val = -val;
+    }
+    nums[numCount++] = val;
+
+    // 3. Check if end of expression reached
+    if (pos >= calcState.len) {
+      break;
+    }
+
+    // 4. Next character must be a binary operator (+, -, *, /) followed by another operand
+    char op = calcState.expr[pos];
+    if (!isOperatorChar(op) || (pos + 1) >= calcState.len) {
+      setCalcError("ERR: INVALID");
+      return;
+    }
+    ops[opCount++] = op;
+    ++pos;
+  }
+
+  if (numCount == 0 || opCount != (numCount - 1)) {
+    setCalcError("ERR: INVALID");
+    return;
+  }
+
+  // Pass 1: Evaluate '*' and '/' left-to-right
+  for (uint8_t i = 0; i < opCount; ) {
+    if (ops[i] == '*' || ops[i] == '/') {
+      if (ops[i] == '/') {
+        if (fabs(nums[i + 1]) < 1e-9) {
+          setCalcError("ERR: DIV BY 0");
+          Serial.println(F("[CALC] Error: division by zero"));
+          return;
+        }
+        nums[i] = nums[i] / nums[i + 1];
+      } else {
+        nums[i] = nums[i] * nums[i + 1];
+      }
+
+      for (uint8_t j = i + 1; j + 1 < numCount; ++j) {
+        nums[j] = nums[j + 1];
+      }
+      for (uint8_t j = i; j + 1 < opCount; ++j) {
+        ops[j] = ops[j + 1];
+      }
+      --numCount;
+      --opCount;
+    } else {
+      ++i;
     }
   }
 
-  if (opPos <= 0 || opPos >= static_cast<int8_t>(calcState.len) - 1) {
-    strncpy(calcState.statusLine, "ERR: INVALID", LCD_COLS);
-    calcState.statusLine[LCD_COLS] = '\0';
-    calcState.evaluated = true;
-    sysState.displayDirty = true;
-    Serial.println(F("[CALC] Error: malformed expression"));
-    return;
-  }
-
-  double lhs = 0.0;
-  double rhs = 0.0;
-  uint8_t lhsLen = static_cast<uint8_t>(opPos);
-  uint8_t rhsLen = calcState.len - lhsLen - 1;
-
-  if (!parseSingleOperand(calcState.expr, lhsLen, &lhs) ||
-      !parseSingleOperand(calcState.expr + opPos + 1, rhsLen, &rhs)) {
-    strncpy(calcState.statusLine, "ERR: INVALID", LCD_COLS);
-    calcState.statusLine[LCD_COLS] = '\0';
-    calcState.evaluated = true;
-    sysState.displayDirty = true;
-    Serial.println(F("[CALC] Error: invalid operand"));
-    return;
-  }
-
-  if (opChar == '/' && fabs(rhs) < 1e-9) {
-    strncpy(calcState.statusLine, "ERR: DIV BY 0", LCD_COLS);
-    calcState.statusLine[LCD_COLS] = '\0';
-    calcState.evaluated = true;
-    sysState.displayDirty = true;
-    Serial.println(F("[CALC] Error: division by zero"));
-    return;
-  }
-
-  double result = 0.0;
-  switch (opChar) {
-    case '+': result = lhs + rhs; break;
-    case '-': result = lhs - rhs; break;
-    case '*': result = lhs * rhs; break;
-    case '/': result = lhs / rhs; break;
-    default:  break;
+  // Pass 2: Evaluate '+' and '-' left-to-right
+  double result = nums[0];
+  for (uint8_t i = 0; i < opCount; ++i) {
+    if (ops[i] == '+') {
+      result += nums[i + 1];
+    } else {
+      result -= nums[i + 1];
+    }
   }
 
   formatCalcResult(result, calcState.statusLine, sizeof(calcState.statusLine));
@@ -877,12 +927,39 @@ static void calcEvaluate() {
   Serial.println(calcState.statusLine);
 }
 
+static bool currentOperandCanTakeDecimal() {
+  if (calcState.len == 0) {
+    return false;
+  }
+  char last = calcState.expr[calcState.len - 1];
+  if (last < '0' || last > '9') {
+    return false;
+  }
+  for (int8_t i = static_cast<int8_t>(calcState.len) - 1; i >= 0; --i) {
+    char c = calcState.expr[i];
+    if (c == '.') {
+      return false;
+    }
+    if (isOperatorChar(c)) {
+      break;
+    }
+  }
+  return true;
+}
+
 static void handleCalculatorInput(char key) {
   if (key == '*') {
     if (calcState.len == 0 && !calcState.evaluated) {
       // Pressing '*' when already cleared returns to Home Menu
       switchApp(APP_HOME);
       Serial.println(F("[CALC] Returned to Home Menu"));
+    } else if (!calcState.evaluated && currentOperandCanTakeDecimal() && calcState.len < CALC_MAX_EXPR) {
+      // Pressing '*' once after digits inserts decimal point '.'; pressing '*' again clears
+      calcState.expr[calcState.len++] = '.';
+      calcState.expr[calcState.len] = '\0';
+      strncpy(calcState.statusLine, "*Again:Clr   #=", LCD_COLS);
+      calcState.statusLine[LCD_COLS] = '\0';
+      sysState.displayDirty = true;
     } else {
       calcReset();
       Serial.println(F("[CALC] Input cleared"));
@@ -900,16 +977,28 @@ static void handleCalculatorInput(char key) {
 
   if ((toAppend >= '0' && toAppend <= '9') || toAppend == '.' || isOperatorChar(toAppend)) {
     if (calcState.evaluated) {
-      calcState.expr[0] = '\0';
-      calcState.len = 0;
       calcState.evaluated = false;
-      strncpy(calcState.statusLine, "A+ B- C* D/ #=", LCD_COLS);
+      strncpy(calcState.statusLine, "A+B-C*D/ *. #=", LCD_COLS);
       calcState.statusLine[LCD_COLS] = '\0';
+
+      // If user presses an operator after a valid result, chain from previous result
+      if (isOperatorChar(toAppend) && calcState.hasValidResult) {
+        char prevBuf[16];
+        formatDoubleCompact(calcState.lastResult, prevBuf, sizeof(prevBuf));
+        strncpy(calcState.expr, prevBuf, CALC_MAX_EXPR);
+        calcState.expr[CALC_MAX_EXPR] = '\0';
+        calcState.len = static_cast<uint8_t>(strlen(calcState.expr));
+      } else {
+        calcState.expr[0] = '\0';
+        calcState.len = 0;
+      }
     }
 
     if (calcState.len < CALC_MAX_EXPR) {
       calcState.expr[calcState.len++] = toAppend;
       calcState.expr[calcState.len] = '\0';
+      strncpy(calcState.statusLine, "A+B-C*D/ *. #=", LCD_COLS);
+      calcState.statusLine[LCD_COLS] = '\0';
       sysState.displayDirty = true;
     } else {
       strncpy(calcState.statusLine, "ERR: MAX LEN", LCD_COLS);
@@ -921,7 +1010,15 @@ static void handleCalculatorInput(char key) {
 }
 
 static void renderCalculatorApp() {
-  const char* line0 = (calcState.len > 0) ? calcState.expr : "CALC: 0";
+  const char* line0 = "CALC: 0";
+  if (calcState.len > 0) {
+    // Scroll left automatically if expression exceeds 16 characters
+    if (calcState.len > LCD_COLS) {
+      line0 = calcState.expr + (calcState.len - LCD_COLS);
+    } else {
+      line0 = calcState.expr;
+    }
+  }
   renderDisplayLines(line0, calcState.statusLine);
 }
 
