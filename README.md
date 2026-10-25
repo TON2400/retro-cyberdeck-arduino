@@ -32,5 +32,5 @@ Read these documents in order:
 Start with Milestone 1: compile the minimal Uno sketch, detect the board, and upload only after confirming the actual port and obtaining user approval.
 
 ## Budget
+<=1000 baht thai 
 
-Current milestones must use existing hardware and must not require purchases.
