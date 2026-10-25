@@ -5,6 +5,7 @@
 #include <ThreeWire.h>
 #include <RtcDS1302.h>
 #include <DHT.h>
+#include <EEPROM.h>
 #include <avr/interrupt.h>
 #include <stdlib.h>
 #include <string.h>
@@ -262,9 +263,41 @@ static void advanceSoftwareClockOneSecond() {
   }
 }
 
+static const int EEPROM_BUILD_MAGIC_ADDR = 0;
+static const int EEPROM_BUILD_TIME_ADDR  = 1;
+static const uint8_t EEPROM_BUILD_MAGIC  = 0xCD;
+
+static void applyDateTimeToClock(const RtcDateTime& dt) {
+  clockState.year = dt.Year();
+  clockState.month = dt.Month();
+  clockState.day = dt.Day();
+  clockState.hour = dt.Hour();
+  clockState.minute = dt.Minute();
+  clockState.second = dt.Second();
+  clockState.lastTickMs = millis();
+
+  rtc.SetIsWriteProtected(false);
+  rtc.SetIsRunning(true);
+  rtc.SetDateTime(dt);
+
+  RtcDateTime verify = rtc.GetDateTime();
+  clockState.hwValid = isRtcTimePlausible(verify);
+  if (sysState.activeApp == APP_CLOCK) {
+    sysState.displayDirty = true;
+  }
+}
+
 static void initClockService() {
   rtc.Begin();
   RtcDateTime compiled(__DATE__, __TIME__);
+  // Compensate ~6 seconds for compile + avrdude flash time
+  RtcDateTime uploadTarget = compiled + 6;
+  uint32_t buildStamp = compiled.TotalSeconds();
+
+  uint8_t magic = EEPROM.read(EEPROM_BUILD_MAGIC_ADDR);
+  uint32_t savedStamp = 0;
+  EEPROM.get(EEPROM_BUILD_TIME_ADDR, savedStamp);
+  bool isNewUpload = (magic != EEPROM_BUILD_MAGIC) || (savedStamp != buildStamp);
 
   if (rtc.GetIsWriteProtected()) {
     rtc.SetIsWriteProtected(false);
@@ -274,7 +307,12 @@ static void initClockService() {
   }
 
   RtcDateTime now = rtc.GetDateTime();
-  if (isRtcTimePlausible(now)) {
+  if (isNewUpload || !isRtcTimePlausible(now) || now < compiled) {
+    applyDateTimeToClock(uploadTarget);
+    EEPROM.update(EEPROM_BUILD_MAGIC_ADDR, EEPROM_BUILD_MAGIC);
+    EEPROM.put(EEPROM_BUILD_TIME_ADDR, buildStamp);
+    Serial.println(F("[RTC] Synced clock to computer upload time."));
+  } else {
     clockState.year = now.Year();
     clockState.month = now.Month();
     clockState.day = now.Day();
@@ -282,18 +320,26 @@ static void initClockService() {
     clockState.minute = now.Minute();
     clockState.second = now.Second();
     clockState.hwValid = true;
-  } else {
-    clockState.year = compiled.Year();
-    clockState.month = compiled.Month();
-    clockState.day = compiled.Day();
-    clockState.hour = compiled.Hour();
-    clockState.minute = compiled.Minute();
-    clockState.second = compiled.Second();
-    rtc.SetDateTime(compiled);
-    RtcDateTime verify = rtc.GetDateTime();
-    clockState.hwValid = isRtcTimePlausible(verify);
+    clockState.lastTickMs = millis();
   }
-  clockState.lastTickMs = millis();
+}
+
+static void syncClockFromSerialDigits(const char* digits14) {
+  uint16_t yr = static_cast<uint16_t>((digits14[0] - '0') * 1000 +
+                                      (digits14[1] - '0') * 100 +
+                                      (digits14[2] - '0') * 10 +
+                                      (digits14[3] - '0'));
+  uint8_t mo = static_cast<uint8_t>((digits14[4] - '0') * 10 + (digits14[5] - '0'));
+  uint8_t dy = static_cast<uint8_t>((digits14[6] - '0') * 10 + (digits14[7] - '0'));
+  uint8_t hh = static_cast<uint8_t>((digits14[8] - '0') * 10 + (digits14[9] - '0'));
+  uint8_t mm = static_cast<uint8_t>((digits14[10] - '0') * 10 + (digits14[11] - '0'));
+  uint8_t ss = static_cast<uint8_t>((digits14[12] - '0') * 10 + (digits14[13] - '0'));
+
+  RtcDateTime dt(yr, mo, dy, hh, mm, ss);
+  if (isRtcTimePlausible(dt)) {
+    applyDateTimeToClock(dt);
+    Serial.println(F("[RTC] Synced exact computer time via Serial."));
+  }
 }
 
 static void updateClockService() {
@@ -1069,11 +1115,27 @@ void loop() {
     processKeyInput(key, false);
   }
 
-  // Serial input bridge for diagnostics and testing
+  // Serial input bridge for diagnostics, computer time sync ('T' + 14 digits), and testing
   if (Serial.available() > 0) {
     char cmd = static_cast<char>(Serial.read());
     if (cmd == 's' || cmd == 'S') {
       initDisplay();
+    } else if (cmd == 'T' || cmd == 't') {
+      char buf[15];
+      uint8_t idx = 0;
+      unsigned long startWait = millis();
+      while (idx < 14 && (millis() - startWait) < 100UL) {
+        if (Serial.available() > 0) {
+          char c = static_cast<char>(Serial.read());
+          if (c >= '0' && c <= '9') {
+            buf[idx++] = c;
+          }
+        }
+      }
+      buf[idx] = '\0';
+      if (idx == 14) {
+        syncClockFromSerialDigits(buf);
+      }
     } else if ((cmd >= '0' && cmd <= '9') || (cmd >= 'A' && cmd <= 'D') ||
                cmd == '*' || cmd == '#' || cmd == '.') {
       processKeyInput(cmd, true);
