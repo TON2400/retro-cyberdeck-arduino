@@ -45,14 +45,14 @@ This is the proposed mapping, not proof of actual wiring. Verify each connection
 
 | Component | Signal | Uno pin |
 |---|---|---|
-| Keypad | R1 | D2 |
-| Keypad | R2 | D3 |
-| Keypad | R3 | D4 |
-| Keypad | R4 | D5 |
-| Keypad | C1 | D6 |
-| Keypad | C2 | D7 |
-| Keypad | C3 | D8 |
-| Keypad | C4 | D9 |
+| Keypad | R1 | D9 |
+| Keypad | R2 | D8 |
+| Keypad | R3 | D7 |
+| Keypad | R4 | D6 |
+| Keypad | C1 | D5 |
+| Keypad | C2 | D4 |
+| Keypad | C3 | D3 |
+| Keypad | C4 | D2 |
 | IR receiver | OUT | D10 |
 | DHT11 | DATA | D11 |
 | DS1302 | CLK | A0 |
